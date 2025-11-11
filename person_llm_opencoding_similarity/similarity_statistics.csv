@@ -1,0 +1,2 @@
+﻿total_individuals,total_pairs,similarity_threshold,pairs_above_threshold,percentage_above_threshold,mean_similarity,median_similarity,max_similarity,min_similarity,std_similarity
+168,14028,0.6,3825,27.266894781864842,0.5403047,0.5314157,0.97549385,0.23937112,0.10724939
