@@ -19,8 +19,8 @@ from sentence_transformers import SentenceTransformer
 # 配置路径
 outpath = 'E:/Rdaima/RIS_theory/llm_raliability'
 llm_models_dir = 'C:/workship/llm_models'
-open_input_file = 'E:/Rdaima/RIS_theory/embedding_second/第二次合并后的编码结果.csv'
-axial_input_file = 'E:/Rdaima/RIS_theory/Axial_output2/轴心编码结果.csv'
+open_input_file = 'E:/Rdaima/RIS_theory/embedding_second/Second_merge_open_coding.csv'
+axial_input_file = 'E:/Rdaima/RIS_theory/Axial_output/轴心编码结果.csv'
 
 def load_embedding_model():
     """加载embedding模型"""
@@ -69,46 +69,58 @@ def extract_statements(text):
     
     return cleaned_statements
 
+def calculate_average_pairwise_cosine(embeddings):
+    """未中心化向量的唯一两两余弦均值；不包含自身比较。"""
+    x = np.asarray(embeddings, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 1:
+        raise ValueError("平均两两余弦相似度至少需要两个非空向量")
+    if not np.isfinite(x).all():
+        raise ValueError("向量包含非有限值")
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    if not np.isfinite(norms).all() or np.any(norms == 0):
+        raise ValueError("向量范数为零或非有限值")
+    unit = x / norms  # 不减去各向量的均值
+    similarities = np.clip(unit @ unit.T, -1.0, 1.0)
+    return float(similarities[np.triu_indices(x.shape[0], k=1)].mean())
+
+
 def calculate_reliability_metrics(embeddings):
-    """计算信度指标 - 正确版本"""
-    n = len(embeddings)
-    
-    if n < 2:
-        return {
-            'cronbach_alpha': 0.0,
-            'average_interitem_correlation': 0.0,
-            'item_count': n
-        }
-    
+    """两项指标独立检查有效性；无效值记录为 NaN，并保留原因。"""
+    x = np.asarray(embeddings, dtype=np.float64)
+    result = {
+        'item_count': x.shape[0] if x.ndim == 2 else 0,
+        'embedding_dimension': x.shape[1] if x.ndim == 2 else 0,
+        'cronbach_alpha': np.nan,
+        'average_interitem_correlation': np.nan,
+        'average_pairwise_cosine': np.nan,
+        'alpha_status': 'ok', 'cosine_status': 'ok',
+    }
     try:
-        # 计算余弦相似度矩阵
-        similarity_matrix = cosine_similarity(embeddings)
-        
-        # 计算平均项目间相关（排除对角线）
-        mask = ~np.eye(n, dtype=bool)
-        avg_correlation = np.mean(similarity_matrix[mask])
-        
-        # 使用标准化的克隆巴赫Alpha公式
-        # α = (n * r̄) / (1 + (n - 1) * r̄)
-        # 其中r̄是平均项目间相关
-        if avg_correlation > 0:
-            alpha = (n * avg_correlation) / (1 + (n - 1) * avg_correlation)
-        else:
-            alpha = 0.0
-        
-        return {
-            'cronbach_alpha': max(0, min(1, alpha)),
-            'average_interitem_correlation': max(0, min(1, avg_correlation)),
-            'item_count': n
-        }
-        
-    except Exception as e:
-        print(f"计算信度指标时出错: {e}")
-        return {
-            'cronbach_alpha': 0.0,
-            'average_interitem_correlation': 0.0,
-            'item_count': n
-        }
+        result['average_pairwise_cosine'] = calculate_average_pairwise_cosine(x)
+    except ValueError as exc:
+        result['cosine_status'] = str(exc)
+    try:
+        if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 2:
+            raise ValueError("alpha 至少需要两个项目，每个向量至少两个维度")
+        if not np.isfinite(x).all():
+            raise ValueError("嵌入向量包含非有限值")
+        centered = x - x.mean(axis=1, keepdims=True)
+        norms = np.linalg.norm(centered, axis=1, keepdims=True)
+        if np.any(norms == 0) or not np.isfinite(norms).all():
+            raise ValueError("存在常量向量或中心化范数异常，相关无定义")
+        unit = centered / norms
+        corr = np.clip(unit @ unit.T, -1.0, 1.0)
+        n = x.shape[0]
+        r_bar = float(corr[np.triu_indices(n, k=1)].mean())
+        result['average_interitem_correlation'] = r_bar
+        denominator = 1.0 + (n - 1) * r_bar
+        if denominator <= 1e-12:
+            raise ValueError("alpha 分母不大于 1e-12，系数无定义或数值不稳定")
+        result['cronbach_alpha'] = float(n * r_bar / denominator)
+    except ValueError as exc:
+        result['alpha_status'] = str(exc)
+    return result
+
 
 def analyze_open_coding_reliability_statements(model, open_coding_df):
     """分析开放式编码的信度 - 基于具体语句汇总"""
@@ -145,6 +157,10 @@ def analyze_open_coding_reliability_statements(model, open_coding_df):
                 '编码名称': coding_name,
                 '语句数量': reliability_metrics['item_count'],
                 '克隆巴赫Alpha': reliability_metrics['cronbach_alpha'],
+                '平均两两余弦相似度': reliability_metrics['average_pairwise_cosine'],
+                'Alpha状态': reliability_metrics['alpha_status'],
+                '余弦状态': reliability_metrics['cosine_status'],
+                '嵌入维度': reliability_metrics['embedding_dimension'],
                 '平均项目间相关': reliability_metrics['average_interitem_correlation'],
                 '来源文件数量': row.get('来源文件数量', 'N/A'),
                 '总出现次数': row.get('总出现次数', 'N/A'),
@@ -194,6 +210,10 @@ def analyze_open_coding_reliability_merged(model, open_coding_df):
                 '编码名称': coding_name,
                 '被合并编码数量': reliability_metrics['item_count'],
                 '克隆巴赫Alpha': reliability_metrics['cronbach_alpha'],
+                '平均两两余弦相似度': reliability_metrics['average_pairwise_cosine'],
+                'Alpha状态': reliability_metrics['alpha_status'],
+                '余弦状态': reliability_metrics['cosine_status'],
+                '嵌入维度': reliability_metrics['embedding_dimension'],
                 '平均项目间相关': reliability_metrics['average_interitem_correlation'],
                 '来源文件数量': row.get('来源文件数量', 'N/A'),
                 '总出现次数': row.get('总出现次数', 'N/A'),
@@ -243,6 +263,10 @@ def analyze_axial_coding_reliability(model, axial_coding_df):
                 '核心类别': core_category.replace('**', '').strip(),
                 '被合并编码数量': reliability_metrics['item_count'],
                 '克隆巴赫Alpha': reliability_metrics['cronbach_alpha'],
+                '平均两两余弦相似度': reliability_metrics['average_pairwise_cosine'],
+                'Alpha状态': reliability_metrics['alpha_status'],
+                '余弦状态': reliability_metrics['cosine_status'],
+                '嵌入维度': reliability_metrics['embedding_dimension'],
                 '平均项目间相关': reliability_metrics['average_interitem_correlation'],
                 '来源文件数量': row.get('来源文件数量', 'N/A'),
                 '总出现次数': row.get('总出现次数', 'N/A'),
@@ -265,10 +289,15 @@ def analyze_selective_coding_reliability(model, axial_coding_df):
     core_categories = []
     
     for idx, row in axial_coding_df.iterrows():
-        core_category = row['核心类别'].replace('**', '').strip()
+        core_category = str(row['核心类别']).replace('**', '').strip() if pd.notna(row['核心类别']) else ''
         if core_category and pd.notna(core_category):
             core_categories.append(core_category)
     
+    if len(core_categories) != len(set(core_categories)):
+        raise ValueError("核心类别名称重复：请核查轴心编码表是否每个类别仅占一行")
+    if len(core_categories) != 6:
+        raise ValueError(f"论文预期六个核心类别，实际为 {len(core_categories)} 个，请核查输入")
+
     # 计算核心类别之间的信度
     if len(core_categories) >= 2:
         print(f"选择性编码分析: {len(core_categories)} 个核心类别")
@@ -290,6 +319,10 @@ def analyze_selective_coding_reliability(model, axial_coding_df):
                 '核心类别数量': len(core_categories),
                 '信度类型': '核心类别名称间信度',
                 '克隆巴赫Alpha': reliability_metrics['cronbach_alpha'],
+                '平均两两余弦相似度': reliability_metrics['average_pairwise_cosine'],
+                'Alpha状态': reliability_metrics['alpha_status'],
+                '余弦状态': reliability_metrics['cosine_status'],
+                '嵌入维度': reliability_metrics['embedding_dimension'],
                 '平均项目间相关': reliability_metrics['average_interitem_correlation']
             }]
             
@@ -304,8 +337,9 @@ def analyze_selective_coding_reliability(model, axial_coding_df):
                         '分析类型': f"类别间相似度 - {cat1} vs {cat2}",
                         '核心类别数量': 'N/A',
                         '信度类型': '两两相似度',
-                        '克隆巴赫Alpha': similarity,
-                        '平均项目间相关': similarity
+                        '克隆巴赫Alpha': np.nan,  # 两两余弦相似度不是 alpha
+                        '平均项目间相关': np.nan,
+                        '两两余弦相似度': similarity
                     })
             
             print(f"选择性编码总体信度: Alpha = {reliability_metrics['cronbach_alpha']:.4f}")
@@ -321,18 +355,16 @@ def analyze_selective_coding_reliability(model, axial_coding_df):
     
     return pd.DataFrame()
 
-def interpret_reliability_scores(alpha_score):
-    """解释信度系数的意义"""
-    if alpha_score >= 0.9:
-        return "优秀"
-    elif alpha_score >= 0.8:
-        return "良好"
-    elif alpha_score >= 0.7:
-        return "可接受"
-    elif alpha_score >= 0.6:
-        return "一般"
-    else:
-        return "需要改进"
+def summarize_stage(frame, stage):
+    """各指标分别按有效组进行无权重算术平均，不混入两两详情行。"""
+    result = {'阶段': stage, '输出组数': len(frame)}
+    for column in ['克隆巴赫Alpha', '平均两两余弦相似度']:
+        values = pd.to_numeric(frame[column], errors='coerce') if column in frame else pd.Series(dtype=float)
+        values = values[np.isfinite(values)]
+        result[column + '_有效组数'] = len(values)
+        result[column + '_无权重均值'] = values.mean() if len(values) else np.nan
+    return result
+
 
 def main():
     """主函数"""
@@ -354,9 +386,20 @@ def main():
         axial_results = analyze_axial_coding_reliability(model, axial_coding_df)
         selective_results = analyze_selective_coding_reliability(model, axial_coding_df)
         
+        selective_overall = selective_results[
+            selective_results['分析类型'] == '选择性编码总体信度'
+        ] if not selective_results.empty else selective_results
+        summary = pd.DataFrame([
+            summarize_stage(open_results_statements, '开放式编码_具体语句'),
+            summarize_stage(open_results_merged, '开放式编码_被合并编码_附加分析'),
+            summarize_stage(axial_results, '轴心编码'),
+            summarize_stage(selective_overall, '选择性编码'),
+        ])
         # 保存结果
+        os.makedirs(outpath, exist_ok=True)
         output_file = os.path.join(outpath, 'coding_reliability_analysis_comprehensive.xlsx')
         with pd.ExcelWriter(output_file) as writer:
+            summary.to_excel(writer, sheet_name='阶段汇总', index=False)
             if not open_results_statements.empty:
                 open_results_statements.to_excel(writer, sheet_name='开放式编码_具体语句', index=False)
             
@@ -371,56 +414,10 @@ def main():
         
         print(f"\n分析完成！结果已保存至: {output_file}")
         
-        # 打印摘要统计
-        print("\n=== 信度分析摘要 ===")
-        
-        if not open_results_statements.empty:
-            open_avg_alpha = open_results_statements['克隆巴赫Alpha'].mean()
-            open_best = open_results_statements.loc[open_results_statements['克隆巴赫Alpha'].idxmax()]
-            open_worst = open_results_statements.loc[open_results_statements['克隆巴赫Alpha'].idxmin()]
-            
-            print(f"\n开放式编码信度（基于具体语句）:")
-            print(f"  平均克隆巴赫Alpha: {open_avg_alpha:.4f} ({interpret_reliability_scores(open_avg_alpha)})")
-            print(f"  最高信度: '{open_best['编码名称']}' = {open_best['克隆巴赫Alpha']:.4f}")
-            print(f"  最低信度: '{open_worst['编码名称']}' = {open_worst['克隆巴赫Alpha']:.4f}")
-            print(f"  分析编码数量: {len(open_results_statements)}")
-        
-        if not open_results_merged.empty:
-            open_merged_avg_alpha = open_results_merged['克隆巴赫Alpha'].mean()
-            open_merged_best = open_results_merged.loc[open_results_merged['克隆巴赫Alpha'].idxmax()]
-            open_merged_worst = open_results_merged.loc[open_results_merged['克隆巴赫Alpha'].idxmin()]
-            
-            print(f"\n开放式编码信度（基于被合并编码）:")
-            print(f"  平均克隆巴赫Alpha: {open_merged_avg_alpha:.4f} ({interpret_reliability_scores(open_merged_avg_alpha)})")
-            print(f"  最高信度: '{open_merged_best['编码名称']}' = {open_merged_best['克隆巴赫Alpha']:.4f}")
-            print(f"  最低信度: '{open_merged_worst['编码名称']}' = {open_merged_worst['克隆巴赫Alpha']:.4f}")
-            print(f"  分析编码数量: {len(open_results_merged)}")
-        
-        if not axial_results.empty:
-            axial_avg_alpha = axial_results['克隆巴赫Alpha'].mean()
-            axial_best = axial_results.loc[axial_results['克隆巴赫Alpha'].idxmax()]
-            axial_worst = axial_results.loc[axial_results['克隆巴赫Alpha'].idxmin()]
-            
-            print(f"\n轴心编码信度:")
-            print(f"  平均克隆巴赫Alpha: {axial_avg_alpha:.4f} ({interpret_reliability_scores(axial_avg_alpha)})")
-            print(f"  最高信度: '{axial_best['核心类别']}' = {axial_best['克隆巴赫Alpha']:.4f}")
-            print(f"  最低信度: '{axial_worst['核心类别']}' = {axial_worst['克隆巴赫Alpha']:.4f}")
-            print(f"  分析核心类别数量: {len(axial_results)}")
-        
-        if not selective_results.empty:
-            overall_selective = selective_results[selective_results['分析类型'] == '选择性编码总体信度']
-            if not overall_selective.empty:
-                selective_alpha = overall_selective.iloc[0]['克隆巴赫Alpha']
-                print(f"\n选择性编码信度:")
-                print(f"  总体Alpha: {selective_alpha:.4f} ({interpret_reliability_scores(selective_alpha)})")
-        
-        print(f"\n信度解释标准:")
-        print(f"  ≥ 0.9: 优秀")
-        print(f"  0.8-0.9: 良好") 
-        print(f"  0.7-0.8: 可接受")
-        print(f"  0.6-0.7: 一般")
-        print(f"  < 0.6: 需要改进")
-    
+        print("\n=== 语义凝聚性与探索性内部一致性汇总 ===")
+        print(summary.to_string(index=False))
+        print("各指标独立汇总有效值；不使用常规心理测量信度阈值评级。")
+
     except Exception as e:
         print(f"分析过程中出现错误: {e}")
         import traceback
